@@ -1,0 +1,36 @@
+name: rebus-asb-failure-proof
+
+# Local reproduction environment only. The SQL password below is a throwaway required by the
+# emulator image; nothing here is reachable from outside the compose network except the emulator's
+# AMQP port on localhost.
+
+services:
+  emulator:
+    container_name: rebus-repro-sb-emulator
+    image: mcr.microsoft.com/azure-messaging/servicebus-emulator:latest
+    volumes:
+      - "./emulator/Config.json:/ServiceBus_Emulator/ConfigFiles/Config.json"
+    ports:
+      - "5672:5672"
+      - "5300:5300"
+    environment:
+      SQL_SERVER: sqlserver
+      MSSQL_SA_PASSWORD: "${SQL_PASSWORD:-Repro-Local-Only-Pw1}"
+      ACCEPT_EULA: "${ACCEPT_EULA:-Y}"
+      EMULATOR_HTTP_PORT: 5300
+    depends_on:
+      - sqlserver
+    networks:
+      - sb-repro
+
+  sqlserver:
+    container_name: rebus-repro-sqlserver
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${SQL_PASSWORD:-Repro-Local-Only-Pw1}"
+    networks:
+      - sb-repro
+
+networks:
+  sb-repro:
