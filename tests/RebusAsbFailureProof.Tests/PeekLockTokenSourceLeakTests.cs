@@ -7,72 +7,44 @@ using Rebus.Messages;
 using Rebus.Retry.Simple;
 
 /// <summary>
-/// Reproduces a defect in Rebus.AzureServiceBus' per-message cancellation support (added in 10.5.0).
+/// Regression tests for rebus-org/Rebus.AzureServiceBus#117, fixed in 10.7.1.
 ///
-/// AzureServiceBusTransport.Receive keeps a per-message CancellationTokenSource in
-/// _messageRenewerTokenSources, keyed by ServiceBus MessageId:
+/// Before the fix, AzureServiceBusTransport.Receive tracked a per-message CancellationTokenSource
+/// keyed by ServiceBus MessageId. MessageId identifies a *message*, but the tracked resource is a
+/// *delivery* - and Azure Service Bus is at-least-once, so the same MessageId is legitimately in
+/// flight twice whenever a peek lock lapses and the broker redelivers while the handler is still
+/// running. TryAdd then failed, the token source was disposed, and .Token was read from the disposed
+/// instance:
 ///
-///     var renewFailedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(...);   // L620
-///     if (!_messageRenewerTokenSources.TryAdd(message.MessageId, renewFailedTokenSource))  // L621
-///     {
-///         // should never happen though
-///         renewFailedTokenSource.Dispose();                                                // L624
-///     }
-///     ...
-///     items["asb-message-cancel-token"] = renewFailedTokenSource.Token;                    // L632
+///     System.ObjectDisposedException: The CancellationTokenSource has been disposed.
+///        at System.Threading.CancellationTokenSource.get_Token()
+///        at Rebus.AzureServiceBus.AzureServiceBusTransport.Receive(...)
+///        at Rebus.Workers.ThreadPoolBased.ThreadPoolWorker.ReceiveTransportMessage(...)
 ///
-/// MessageId identifies a *message*; what is being tracked is a *delivery*. Azure Service Bus is
-/// at-least-once, so the same MessageId is legitimately in flight twice whenever a peek lock lapses
-/// and the broker redelivers while the first delivery is still being handled. TryAdd then fails,
-/// the token source is disposed, and .Token is read from the disposed instance.
+/// Because the throw happened inside Receive - before dispatch - no handler ran, the retry step
+/// never ran, maxDeliveryAttempts never incremented, and the message could not reach the Rebus
+/// error queue. It was redelivered every lock duration until MaxDeliveryCount was exhausted and the
+/// broker dead-lettered it natively.
 ///
-/// The ObjectDisposedException is thrown inside Receive, i.e. BEFORE dispatch:
-///   - no handler runs, so IFailed&lt;T&gt; and second-level retries never engage;
-///   - the retry step never runs, so maxDeliveryAttempts never increments and the message can
-///     never reach the Rebus error queue;
-///   - the message is never abandoned (TransactionContext.Dispose does not invoke OnNack when
-///     _mustAck is null), so it stays locked for the full lock duration each time.
-/// It is therefore redelivered every lock duration until MaxDeliveryCount is exhausted and the
-/// broker dead-letters it natively.
-///
-/// Note L620 sits OUTSIDE the `AutomaticallyRenewPeekLock &amp;&amp; !_prefetchingEnabled` guard, so this
-/// is not limited to users of automatic peek lock renewal - see the third test.
+/// 10.7.1 keys the tracking by lock token, which is unique per delivery attempt. These tests assert
+/// the fixed behaviour, so they PASS on 10.7.1+ and FAIL on 10.5.0 - 10.7.0.
 /// </summary>
 [TestClass]
 public class PeekLockTokenSourceLeakTests
 {
     /// <summary>
-    /// THE HEADLINE CASE. A single message, one genuine broker redelivery after a lock lapse.
+    /// The headline case: one message, one genuine broker redelivery after a lock lapse.
     ///
-    /// repro.lockrecover has LockDuration PT5S and MaxDeliveryCount 5. The handler exceeds the
-    /// lock on its FIRST invocation only and returns immediately on every later one, so a correct
-    /// client recovers: delivery #2 is dispatched, completes in milliseconds, and the message is
-    /// settled well inside the lock. Nothing here is misconfigured - losing a lock is a normal
-    /// Azure Service Bus condition that the at-least-once contract exists to handle.
+    /// repro.lockrecover has LockDuration PT5S and MaxDeliveryCount 5. The handler overruns the lock
+    /// on its FIRST invocation only and returns immediately on every later one, so the redelivery is
+    /// trivially processable - it needs milliseconds and has a full 5 seconds.
     ///
-    /// The short lock only makes the single lapse deterministic; it is NOT what causes the failure.
-    /// Crucially, the message is still comfortably processable after the lapse - four further
-    /// deliveries each had a full 5 seconds to run a handler that needs milliseconds.
-    ///
-    /// Correct behaviour: delivery #2 arrives at ~5s, the handler returns immediately, the message
-    /// is completed. Actual behaviour: every redelivery that overlaps delivery #1 throws
-    /// ObjectDisposedException inside Receive and is silently discarded - the handler is never
-    /// entered, and the broker delivery attempts are burned. Processing only resumes once delivery
-    /// #1's context finally goes away.
-    ///
-    /// Whether that ends in dead-lettering depends on whether MaxDeliveryCount is exhausted before
-    /// the first delivery completes. In production (LockDuration PT5M, MaxDeliveryCount 10) it was:
-    /// 10 receive failures spaced exactly 5 minutes apart, then a native dead-letter. This test
-    /// asserts only the part it can attribute unambiguously - that the overlapping redeliveries are
-    /// discarded without dispatch.
-    ///
-    /// What actually happens is that every redelivery is poisoned, the handler is never entered
-    /// again, and the broker dead-letters the message. The bug converts a RECOVERABLE lock loss
-    /// into a permanently unprocessable message.
+    /// Fixed behaviour: the redelivery is dispatched while delivery #1 is still in flight, the
+    /// handler returns immediately, and the message is settled. Nothing is dead-lettered.
     /// </summary>
     [TestMethod]
     [Timeout(300_000)]
-    public async Task RecoverableLockLapse_ThenEveryRedeliveryIsPoisonedAndTheBrokerDeadLettersTheMessage()
+    public async Task RecoverableLockLapse_ThenTheRedeliveryIsDispatchedAndTheMessageIsSettled()
     {
         // Stage
         await DrainQueueAsync(Emulator.LockRecoverQueue);
@@ -92,12 +64,10 @@ public class PeekLockTokenSourceLeakTests
             if (invocation == 1)
             {
                 // Overrun the 5s lock on the first delivery only, and stay in flight long enough
-                // for the broker to redeliver several times.
+                // for the broker to redeliver.
                 await Task.Delay(TimeSpan.FromSeconds(40));
                 firstDeliveryFinishedAt = DateTimeOffset.UtcNow;
             }
-
-            // Any later invocation returns immediately - this is where a correct client settles.
         });
 
         var bus = Configure.With(activator)
@@ -112,8 +82,8 @@ public class PeekLockTokenSourceLeakTests
                 o.SetNumberOfWorkers(3);
                 o.SetMaxParallelism(3);
 
-                // Deliberately high, so anything in the error queue is Rebus' doing and anything
-                // dead-lettered is the broker's doing.
+                // Deliberately high, so anything reaching the error queue is Rebus doing it and
+                // anything dead-lettered is the broker doing it.
                 o.RetryStrategy(errorQueueName: Emulator.ErrorQueue, maxDeliveryAttempts: 50);
             })
             .Start();
@@ -126,54 +96,78 @@ public class PeekLockTokenSourceLeakTests
         var disposedFailures = logs.WithException<ObjectDisposedException>();
         var overlapEnd = firstDeliveryFinishedAt ?? DateTimeOffset.MaxValue;
         var dispatchesDuringOverlap = invocationTimes.Skip(1).Count(t => t < overlapEnd);
+        var deadLettered = await PeekDeadLetterQueueAsync(Emulator.LockRecoverQueue);
 
         // Assert
-        Console.WriteLine($"handler invocations:              {handlerInvocations}");
-        Console.WriteLine($"first delivery finished at:       {firstDeliveryFinishedAt:HH:mm:ss.fff}");
-        Console.WriteLine($"ObjectDisposedException events:   {disposedFailures.Length}");
-        Console.WriteLine($"  of which during the overlap:    {disposedFailures.Count(f => f.At < overlapEnd)}");
+        Console.WriteLine($"handler invocations:                    {handlerInvocations}");
+        Console.WriteLine($"first delivery finished at:             {firstDeliveryFinishedAt:HH:mm:ss.fff}");
+        Console.WriteLine($"ObjectDisposedException events:         {disposedFailures.Length}");
         Console.WriteLine($"redeliveries dispatched during overlap: {dispatchesDuringOverlap}");
-
-        Assert.IsTrue(
-            disposedFailures.Count(f => f.At < overlapEnd) > 0,
-            "Expected at least one broker redelivery, arriving while delivery #1 was still in " +
-            "flight, to trip the disposed CancellationTokenSource inside Receive.");
+        Console.WriteLine($"dead-lettered messages:                 {deadLettered.Count}");
 
         Assert.AreEqual(
             0,
-            dispatchesDuringOverlap,
-            "Expected every redelivery arriving during the overlap to be discarded inside Receive. " +
-            "A correct implementation dispatches one of them - the handler returns in milliseconds " +
-            "on any invocation after the first - and settles the message there.");
+            disposedFailures.Length,
+            "Receive threw ObjectDisposedException. The per-delivery CancellationTokenSource is " +
+            "being keyed by something that collides across concurrent deliveries of one message.");
 
-        // Rebus' own error handling never sees any of this: the throw happens before dispatch, so
-        // the retry step never runs and maxDeliveryAttempts never increments.
+        Assert.IsTrue(
+            dispatchesDuringOverlap > 0,
+            "The redelivery that arrived while delivery #1 was still in flight was never dispatched. " +
+            "It should have been - the handler returns in milliseconds on any invocation after the " +
+            "first, and had a full lock duration to do it.");
+
+        Assert.AreEqual(
+            0,
+            deadLettered.Count,
+            "The message was dead-lettered by the broker even though it was trivially processable.");
+
         Assert.AreEqual(
             0,
             (await PeekQueueAsync(Emulator.ErrorQueue)).Count,
-            "Expected nothing in the Rebus error queue - the failures bypass Rebus' retry pipeline entirely.");
+            "Nothing should have reached the Rebus error queue either.");
     }
 
     /// <summary>
-    /// Minimal isolation of the failing line - NOT evidence that Azure Service Bus produces
-    /// duplicate message ids on its own. Two sends share one explicitly-set MessageId, which is
-    /// supported usage (it is how ASB duplicate detection is driven, and Rebus honours the header),
-    /// but the point of this test is only that it trips the same line in ~100ms without waiting on
-    /// any lock timing. The case that matters is the broker-driven one above.
+    /// Minimal isolation of the same collision, without waiting on lock timing: two sends sharing
+    /// one explicitly-set MessageId, delivered concurrently. Supported usage - it is how ASB
+    /// duplicate detection is driven, and Rebus honours the header.
     /// </summary>
     [TestMethod]
     [Timeout(120_000)]
-    public async Task Receive_WhenSameMessageIdIsInFlightTwice_ThenTransportThrowsObjectDisposedExceptionBeforeDispatch()
+    public async Task Receive_WhenSameMessageIdIsInFlightTwice_ThenBothAreDispatchedWithoutError()
+    {
+        await AssertConcurrentSameMessageIdIsHandledCleanlyAsync(automaticallyRenewPeekLock: true);
+    }
+
+    /// <summary>
+    /// Before the fix the token source was created outside the
+    /// `AutomaticallyRenewPeekLock &amp;&amp; !_prefetchingEnabled` guard, so the defect also hit users who
+    /// never enabled peek lock renewal. Same scenario with renewal off.
+    /// </summary>
+    [TestMethod]
+    [Timeout(120_000)]
+    public async Task Receive_WhenSameMessageIdIsInFlightTwiceAndRenewalIsDisabled_ThenBothAreDispatchedWithoutError()
+    {
+        await AssertConcurrentSameMessageIdIsHandledCleanlyAsync(automaticallyRenewPeekLock: false);
+    }
+
+    private static async Task AssertConcurrentSameMessageIdIsHandledCleanlyAsync(bool automaticallyRenewPeekLock)
     {
         // Stage
         await DrainQueueAsync(Emulator.DuplicateIdQueue);
 
         var logs = new RecordingLoggerFactory();
+        var dispatched = 0;
         using var activator = new BuiltinHandlerActivator();
 
-        activator.Handle<ReproMessage>(async _ => await Task.Delay(TimeSpan.FromSeconds(6)));
+        activator.Handle<ReproMessage>(async _ =>
+        {
+            Interlocked.Increment(ref dispatched);
+            await Task.Delay(TimeSpan.FromSeconds(6));
+        });
 
-        var bus = StartDuplicateIdBus(activator, logs, automaticallyRenewPeekLock: true);
+        var bus = StartDuplicateIdBus(activator, logs, automaticallyRenewPeekLock);
 
         // Act - two messages carrying the SAME ServiceBus MessageId, delivered concurrently.
         await SendTwiceWithOneMessageIdAsync(bus);
@@ -182,52 +176,23 @@ public class PeekLockTokenSourceLeakTests
 
         // Assert
         var disposedFailures = logs.WithException<ObjectDisposedException>();
+        Console.WriteLine($"renewal enabled:                   {automaticallyRenewPeekLock}");
+        Console.WriteLine($"dispatched to handler:             {dispatched}");
         Console.WriteLine($"ObjectDisposedException log events: {disposedFailures.Length}");
         foreach (var failure in disposedFailures.Take(3))
         {
             Console.WriteLine($"  [{failure.Level}] {failure.Message}");
         }
 
-        Assert.IsTrue(disposedFailures.Length > 0, "Expected the disposed CancellationTokenSource to be tripped.");
+        Assert.AreEqual(
+            0,
+            disposedFailures.Length,
+            "Receive threw ObjectDisposedException for the second concurrent delivery of the same MessageId.");
 
-        Assert.IsTrue(
-            disposedFailures.Any(f => f.Message.Contains("receive", StringComparison.OrdinalIgnoreCase)),
-            "Expected the ObjectDisposedException to be thrown from the receive path (before dispatch).");
-    }
-
-    /// <summary>
-    /// The token source is created and keyed at L620, which sits OUTSIDE the
-    /// `AutomaticallyRenewPeekLock &amp;&amp; !_prefetchingEnabled` guard at L641. This test is identical to
-    /// the one above except that automatic peek lock renewal is never switched on - and it still
-    /// fails, so the blast radius is not limited to users of that feature.
-    /// </summary>
-    [TestMethod]
-    [Timeout(120_000)]
-    public async Task Receive_WhenSameMessageIdIsInFlightTwiceAndRenewalIsDisabled_ThenItStillThrows()
-    {
-        // Stage
-        await DrainQueueAsync(Emulator.DuplicateIdQueue);
-
-        var logs = new RecordingLoggerFactory();
-        using var activator = new BuiltinHandlerActivator();
-
-        activator.Handle<ReproMessage>(async _ => await Task.Delay(TimeSpan.FromSeconds(6)));
-
-        var bus = StartDuplicateIdBus(activator, logs, automaticallyRenewPeekLock: false);
-
-        // Act
-        await SendTwiceWithOneMessageIdAsync(bus);
-        await Task.Delay(TimeSpan.FromSeconds(20));
-        bus.Dispose();
-
-        // Assert
-        var disposedFailures = logs.WithException<ObjectDisposedException>();
-        Console.WriteLine($"ObjectDisposedException log events (renewal DISABLED): {disposedFailures.Length}");
-
-        Assert.IsTrue(
-            disposedFailures.Length > 0,
-            "Expected the defect to occur even with AutomaticallyRenewPeekLock() never called, " +
-            "because the token source is created outside that guard.");
+        Assert.AreEqual(
+            2,
+            dispatched,
+            "Both messages should have been dispatched to the handler.");
     }
 
     private static Rebus.Bus.IBus StartDuplicateIdBus(
@@ -268,6 +233,13 @@ public class PeekLockTokenSourceLeakTests
     {
         await using var client = new ServiceBusClient(Emulator.ConnectionString);
         return await client.CreateReceiver(queue).PeekMessagesAsync(10);
+    }
+
+    private static async Task<IReadOnlyList<ServiceBusReceivedMessage>> PeekDeadLetterQueueAsync(string queue)
+    {
+        await using var client = new ServiceBusClient(Emulator.ConnectionString);
+        var receiver = client.CreateReceiver(queue, new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });
+        return await receiver.PeekMessagesAsync(10);
     }
 
     private static async Task DrainQueueAsync(string queue)
